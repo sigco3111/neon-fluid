@@ -8,6 +8,24 @@
 
 ---
 
+## 🎬 라이브 데모 (Live Demo)
+
+> **👉 [https://neon-fluid-one.vercel.app/](https://neon-fluid-one.vercel.app/)** — 브라우저에서 바로 실행 (60fps)
+
+| | |
+|---|---|
+| ![Demo](https://img.shields.io/badge/Live-Demo-7C3AED?style=for-the-badge&logo=vercel&logoColor=white) | [![Repo](https://img.shields.io/badge/GitHub-sigco3111%2Fneon--fluid-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sigco3111/neon-fluid) |
+| ![Status](https://img.shields.io/badge/Status-Live-22C55E?style=flat-square) | ![Stack](https://img.shields.io/badge/Stack-Vanilla_JS-F7DF1E?style=flat-square&logo=javascript&logoColor=black) |
+| ![License](https://img.shields.io/badge/License-MIT-F1C40F?style=flat-square) | ![Deps](https://img.shields.io/badge/Dependencies-0-9CA3AF?style=flat-square) |
+
+### 🎮 빠른 사용법
+1. 위 데모 링크 클릭 → 브라우저에서 페이지 열기
+2. **마우스 이동** — 커서 주변 입자 반발
+3. **마우스 클릭(홀드)** — 블랙홀처럼 입자 흡입
+4. **마우스 떼기** — 입자 자연스럽게 퍼져나감
+
+---
+
 ## 🤖 생성 정보 (Attribution)
 
 이 프로젝트의 코드는 아래 모델과 프롬프트를 이용해 **자동으로 생성**되었습니다.
