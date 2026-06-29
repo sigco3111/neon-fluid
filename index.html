@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>neon-fluid</title>
+<style>
+  html,body{height:100%;margin:0;background:#02030a;overflow:hidden;color:#dfeaff}
+  #stage{display:block;width:100vw;height:100vh;cursor:crosshair;touch-action:none}
+  #stage.down{cursor:grabbing}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+/*
+ * neon-fluid
+ * ---------------------------------------------------------------------------
+ * 3000-particle additive fluid sim in a single HTML file. No deps, no fetches,
+ * no external assets. Designed to hit >=55fps on a modern laptop from file://.
+ *
+ * Pipeline per frame (single hot loop, one allocation outside the loop):
+ *
+ *   1. Trail fade       — ctx.fillStyle = TRAIL_FADE, source-over, full rect.
+ *                         Leaves comet trails without clearing (fades toward
+ *                         deep navy over ~8 frames).
+ *   2. Black-hole spot  — radial gradient (rgba 0,0,0,0.55 -> 0) at cursor,
+ *                         drawn BEFORE particles so the additive pass brightens
+ *                         the rim while leaving the well dim ("swirl into
+ *                         dark spot" gravitational look, not hollow ring).
+ *   3. Spatial hash     — classic "linked list in flat Int32Array" pattern.
+ *                         Zero Map / object allocation in the hot path.
+ *                         gridHead[cell] = index of first particle in cell,
+ *                         gridNext[i]    = next particle in same cell, or -1.
+ *   4. Physics + render — for each particle:
+ *                           a. walk 3x3 neighbor cells (guaranteed to contain
+ *                              every particle within INTERACTION_RADIUS, since
+ *                              CELL_SIZE = 2 * INTERACTION_RADIUS),
+ *                           b. short-range repulsion + density count,
+ *                           c. mouse force (repulsion on hover, quadratic
+ *                              attraction on press),
+ *                           d. random noise + dt-scaled damping + speed cap,
+ *                           e. integrate + soft wrap (no rubber bounce),
+ *                           f. color via hsl(hue, sat, lit) where
+ *                              hue  = baseHue + normSpeed * 60  (warm shift),
+ *                              sat  = 0.55 + clamp(density) * 0.04,
+ *                              lit  = 0.55 + normSpeed * 0.12,
+ *                           g. draw with globalCompositeOperation = 'lighter'.
+ *   5. Vignette         — soft radial gradient drawn LAST (source-over) so
+ *                         corner darkening doesn't fight the additive core.
+ *
+ * Constants chosen:
+ *   NUM_PARTICLES      = 3050   (spec — strictly >3000 to satisfy '3000+')
+ *   CELL_SIZE          = 16 px  (= 2 * INTERACTION_RADIUS; standard SPH choice,
+ *                                guarantees no neighbor is missed)
+ *   INTERACTION_RADIUS = 8 px   (short-range repulsion / density sample)
+ *   REPEL_RADIUS       = 120 px (hover push)
+ *   ATTRACT_RADIUS     = 220 px (press pull, with (1-d/r)^2 falloff)
+ *   MAX_SPEED          = 4.0    (prevents NaN under hard attractor pull and
+ *                                keeps additive trails from saturating to
+ *                                pure white in dense regions)
+ *   DAMPING            = 0.985  per 1/60s, dt-scaled so motion is stable
+ *                                across frame jitter
+ *   NOISE_AMP          = 0.015  random kick — keeps system from freezing
+ *                                into a stable lattice
+ *   BASE_HUE           = 185°   cyan-teal starting hue (each particle gets
+ *                                BASE_HUE +/- 15 random offset)
+ *   HUE_WARM_SHIFT     = 60°    max warm shift at MAX_SPEED
+ *   PARTICLE_RADIUS    = 1.9 px visual radius
+ *   DPR_CAP            = 2      caps backing store at 2x to avoid 4K cliffs
+ *   TRAIL_FADE         = rgba(2,3,10,0.18)  (deep-navy fade, not pure black —
+ *                                keeps additive hues readable)
+ *
+ * Performance notes:
+ *   - Linked-list grid + flat typed arrays means the per-frame allocations
+ *     are zero in the hot path. Only allocations are two radial gradients
+ *     (vignette + black-hole spot), which are required because positions
+ *     and sizes change.
+ *   - sqrt is used only when needed (collision forces + speed color), and
+ *     Math.pow(DAMPING, dt*60) keeps damping frame-rate independent.
+ *   - Particles that wrap around the canvas re-enter from the opposite
+ *     edge. Soft wrap avoids visible rubber reflections off walls.
+ *   - QA hook: window.__neonFluid exposes { fps, particles, mouse, bounds }.
+ */
+(function () {
+  'use strict';
+
+  // ===== Constants (tune here) =====
+  const NUM_PARTICLES      = 3050;
+  const CELL_SIZE          = 16;
+  const INTERACTION_RADIUS = 8;
+  const REPEL_RADIUS       = 120;
+  const ATTRACT_RADIUS     = 220;
+  const MAX_SPEED          = 4.0;
+  const DAMPING            = 0.985;
+  const NOISE_AMP          = 0.015;
+  const BASE_HUE           = 185;
+  const HUE_WARM_SHIFT     = 60;
+  const PARTICLE_RADIUS    = 1.9;
+  const DPR_CAP            = 2;
+  const TRAIL_FADE         = 'rgba(2,3,10,0.18)';
+  const BG_COLOR           = '#02030a';
+
+  // ===== Canvas =====
+  const canvas = document.getElementById('stage');
+  const ctx    = canvas.getContext('2d', { alpha: false });
+  let W = 0, H = 0, DPR = 1;
+  let GW = 0, GH = 0;
+
+  // Static vignette: pre-rendered into an offscreen canvas during resize()
+  // so the per-frame loop can drawImage() it instead of re-evaluating a
+  // 1M+ pixel radial gradient every frame. Big perf win.
+  let vignetteCanvas = null;
+  let vignetteCtx    = null;
+
+  // ===== Particle storage (typed arrays, no per-frame JS object allocation) =====
+  const x       = new Float32Array(NUM_PARTICLES);
+  const y       = new Float32Array(NUM_PARTICLES);
+  const vx      = new Float32Array(NUM_PARTICLES);
+  const vy      = new Float32Array(NUM_PARTICLES);
+  const baseHue = new Float32Array(NUM_PARTICLES);
+
+  // Spatial hash: head[idx] = first particle in cell, next[i] = next in same cell.
+  let gridHead, gridNext;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    GW = Math.ceil(W / CELL_SIZE) + 2;
+    GH = Math.ceil(H / CELL_SIZE) + 2;
+    gridHead = new Int32Array(GW * GH);
+    gridNext = new Int32Array(NUM_PARTICLES);
+    // Solid bg so first frame is not the canvas default (white).
+    ctx.fillStyle = BG_COLOR;
+    ctx.fillRect(0, 0, W, H);
+
+    // Pre-render the static vignette into the offscreen canvas once — the
+    // gradient only depends on W/H, so this avoids re-evaluating a
+    // 1M+ pixel radial gradient every frame. Use alpha at the corners to
+    // darken (center stays transparent so particles at canvas middle
+    // remain unobscured).
+    vignetteCanvas = document.createElement('canvas');
+    vignetteCanvas.width  = W;
+    vignetteCanvas.height = H;
+    vignetteCtx = vignetteCanvas.getContext('2d');
+    const _vCx = W * 0.5, _vCy = H * 0.5;
+    const _vg  = vignetteCtx.createRadialGradient(
+      _vCx, _vCy, Math.min(W, H) * 0.35,
+      _vCx, _vCy, Math.max(W, H) * 0.80
+    );
+    _vg.addColorStop(0, 'rgba(0,0,0,0)');
+    _vg.addColorStop(1, 'rgba(0,0,0,0.45)');
+    vignetteCtx.fillStyle = _vg;
+    vignetteCtx.fillRect(0, 0, W, H);
+  }
+
+  function seedParticles() {
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+      x[i]  = Math.random() * W;
+      y[i]  = Math.random() * H;
+      vx[i] = (Math.random() - 0.5) * 0.6;
+      vy[i] = (Math.random() - 0.5) * 0.6;
+      // Slight per-particle hue variation around the cyan-teal base.
+      baseHue[i] = BASE_HUE + (Math.random() - 0.5) * 30;
+    }
+  }
+
+  resize();
+  seedParticles();
+
+  // On resize, clamp existing particles inside the new bounds (randomize any
+  // that fall outside the smaller canvas).
+  window.addEventListener('resize', () => {
+    resize();
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+      if (x[i] >= W) x[i] = Math.random() * W;
+      if (y[i] >= H) y[i] = Math.random() * H;
+    }
+  });
+
+  // ===== Input (Pointer Events; works for mouse + touch + pen uniformly) =====
+  const mouse = { x: -9999, y: -9999, down: false, active: false, lastMove: 0 };
+
+  function setPosFromEvent(e) {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - r.left;
+    mouse.y = e.clientY - r.top;
+    mouse.active = true;
+    mouse.lastMove = performance.now();
+  }
+
+  canvas.addEventListener('pointermove',  setPosFromEvent);
+  canvas.addEventListener('pointerdown',  e => {
+    setPosFromEvent(e);
+    mouse.down = true;
+    canvas.classList.add('down');
+  });
+  // pointerleave just clears active; the effect still fades smoothly via
+  // mouseInf (time-since-lastMove) instead of snapping off.
+  canvas.addEventListener('pointerleave', () => { mouse.active = false; });
+
+  function release() {
+    mouse.down = false;
+    canvas.classList.remove('down');
+  }
+  // Window-level pointerup so releasing outside the canvas still ends attract.
+  window.addEventListener('pointerup',     release);
+  window.addEventListener('pointercancel', release);
+  window.addEventListener('blur',          release);
+
+  // ===== FPS sampling =====
+  let lastFpsT = performance.now();
+  let frames = 0;
+  let fps = 0;
+
+  // ===== Main loop =====
+  let lastT = performance.now();
+
+  function loop(now) {
+    // dt clamp: avoids huge time jumps after tab-background, and avoids
+    // sub-frame jitter when vsync is uneven.
+    const dtRaw = (now - lastT) / 1000;
+    lastT = now;
+    const dt = dtRaw < 1/120 ? 1/120 : (dtRaw > 1/30 ? 1/30 : dtRaw);
+
+    // 1) Trail fade (source-over, low-alpha navy) — leaves comet trails.
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = TRAIL_FADE;
+    ctx.fillRect(0, 0, W, H);
+
+    // 2) Black-hole dark spot at cursor — drawn BEFORE particles so the
+    //    additive pass brightens the rim while the center stays dim,
+    //    giving a "swirl into a dim spot" gravitational-well feel.
+    //    Intensity fades with mouseInf so it doesn't snap off when the
+    //    cursor leaves the canvas.
+    const sinceMove = (now - mouse.lastMove) / 1000;
+    const mouseInf  = sinceMove < 1.5 ? (1 - sinceMove / 1.5) : 0;
+    if (mouse.down && mouseInf > 0.02) {
+      const dg = ctx.createRadialGradient(
+        mouse.x, mouse.y, 0,
+        mouse.x, mouse.y, ATTRACT_RADIUS
+      );
+      const a = 0.55 * mouseInf;
+      dg.addColorStop(0,   'rgba(0,0,0,' + a.toFixed(3) + ')');
+      dg.addColorStop(0.7, 'rgba(0,0,0,' + (a * 0.35).toFixed(3) + ')');
+      dg.addColorStop(1,   'rgba(0,0,0,0)');
+      ctx.fillStyle = dg;
+      // Bound the fillRect: the gradient is fully transparent outside
+      // ATTRACT_RADIUS, so we only need to paint the box around the
+      // cursor (typically ~80% less pixel work than full-canvas fill).
+      const bh_bx = Math.max(0, mouse.x - ATTRACT_RADIUS);
+      const bh_by = Math.max(0, mouse.y - ATTRACT_RADIUS);
+      const bh_bw = Math.min(W, mouse.x + ATTRACT_RADIUS) - bh_bx;
+      const bh_bh = Math.min(H, mouse.y + ATTRACT_RADIUS) - bh_by;
+      ctx.fillRect(bh_bx, bh_by, bh_bw, bh_bh);
+    }
+
+    // 3) Build spatial hash (O(n), zero allocation).
+    gridHead.fill(-1);
+    const invCell = 1 / CELL_SIZE;
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+      const ix = (x[i] * invCell) | 0;
+      const iy = (y[i] * invCell) | 0;
+      const gi = iy * GW + ix;
+      gridNext[i] = gridHead[gi];
+      gridHead[gi] = i;
+    }
+
+    // 4) Physics + render (single pass).
+    ctx.globalCompositeOperation = 'lighter';
+
+    const IR    = INTERACTION_RADIUS;
+    const IR2   = IR * IR;
+    const repelR  = REPEL_RADIUS;
+    const repelR2 = repelR * repelR;
+    const attractR  = ATTRACT_RADIUS;
+    const attractR2 = attractR * attractR;
+    const maxSpeed  = MAX_SPEED;
+    const maxSpeed2 = maxSpeed * maxSpeed;
+    const damping   = Math.pow(DAMPING, dt * 60);
+    const mx = mouse.x, my = mouse.y, mDown = mouse.down;
+
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+      let pvx = vx[i], pvy = vy[i];
+      const px = x[i], py = y[i];
+
+      // Walk the 3x3 neighbor cells around (ix, iy).
+      let localDensity = 0;
+      const ix = (px * invCell) | 0;
+      const iy = (py * invCell) | 0;
+      const xMin = ix > 0 ? -1 : 0;
+      const xMax = ix < GW - 1 ? 1 : 0;
+      const yMin = iy > 0 ? -1 : 0;
+      const yMax = iy < GH - 1 ? 1 : 0;
+
+      for (let oy = yMin; oy <= yMax; oy++) {
+        const cy = iy + oy;
+        const rowBase = cy * GW;
+        for (let ox = xMin; ox <= xMax; ox++) {
+          const cx = ix + ox;
+          let j = gridHead[rowBase + cx];
+          while (j !== -1) {
+            if (j !== i) {
+              const dx = x[j] - px;
+              const dy = y[j] - py;
+              const d2 = dx*dx + dy*dy;
+              // d2 > 0.01 prevents self-pairing at exactly same pos and
+              // avoids div-by-zero in inv.
+              if (d2 < IR2 && d2 > 0.01) {
+                const d = Math.sqrt(d2);
+                const f = (IR - d) / IR;          // 0..1, strongest when close
+                const inv = 1 / d;
+                const ff = f * 0.5;
+                // Soft-sphere repulsion (SPH-style collision physics):
+                // particles within INTERACTION_RADIUS push each other apart
+                // with a force that grows as 1/d near contact. This is the
+                // standard collision method for fluid simulations (the spec
+                // is "유체 역학 시뮬레이션" — fluid mechanics simulation) and
+                // lets particles settle into a stable dense pile at the
+                // black-hole center rather than scattering on contact.
+                pvx -= dx * inv * ff;
+                pvy -= dy * inv * ff;
+                localDensity++;
+              }
+            }
+            j = gridNext[j];
+          }
+        }
+      }
+
+      // Mouse forces (repulsion on hover, attraction on press).
+      if (mouseInf > 0) {
+        const mdx = mx - px;
+        const mdy = my - py;
+        const md2 = mdx*mdx + mdy*mdy;
+        if (mDown) {
+          if (md2 < attractR2 && md2 > 1) {
+            const md  = Math.sqrt(md2);
+            const u   = 1 - md / attractR;        // 0..1, 1 at center
+            const inv = 1 / md;
+            // (1 - d/r)^2 = quadratic pull, strongest at center (black-hole).
+            const s   = 1.6 * u * u * mouseInf;
+            pvx += mdx * inv * s;
+            pvy += mdy * inv * s;
+          }
+        } else {
+          if (md2 < repelR2) {
+            const md  = Math.sqrt(md2);
+            const u   = 1 - md / repelR;
+            const inv = 1 / md;
+            const s   = 1.3 * u * mouseInf;
+            pvx -= mdx * inv * s;
+            pvy -= mdy * inv * s;
+          }
+        }
+      }
+
+      // Mild noise + frame-rate-independent damping.
+      pvx += (Math.random() - 0.5) * NOISE_AMP;
+      pvy += (Math.random() - 0.5) * NOISE_AMP;
+      pvx *= damping;
+      pvy *= damping;
+
+      // Speed cap — prevents NaN/explosion under strong attractor.
+      const sp2 = pvx*pvx + pvy*pvy;
+      if (sp2 > maxSpeed2) {
+        const k = maxSpeed / Math.sqrt(sp2);
+        pvx *= k;
+        pvy *= k;
+      }
+
+      // Integrate + soft wrap (no rubber bounce off walls).
+      let npx = px + pvx;
+      let npy = py + pvy;
+      if (npx < 0)        npx += W;
+      else if (npx >= W)  npx -= W;
+      if (npy < 0)        npy += H;
+      else if (npy >= H)  npy -= H;
+
+      x[i] = npx;  y[i] = npy;
+      vx[i] = pvx; vy[i] = pvy;
+
+      // Color: HSL — hue shifts warm with speed, sat rises with density.
+      const speed = Math.sqrt(sp2);
+      const normSpeed = sp2 > maxSpeed2 ? 1 : Math.sqrt(sp2) / maxSpeed;
+      const hue  = baseHue[i] + normSpeed * HUE_WARM_SHIFT;
+      const sat  = 0.55 + Math.min(localDensity, 12) * 0.04;
+      const lite = 0.55 + normSpeed * 0.12;
+      ctx.fillStyle =
+        'hsl(' + hue.toFixed(1) + ',' +
+        ((sat  * 100) | 0) + '%,' +
+        ((lite * 100) | 0) + '%)';
+
+      // Render (additive).
+      ctx.beginPath();
+      ctx.arc(npx, npy, PARTICLE_RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // 5) Vignette — blit from offscreen cache (built once in resize()).
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(vignetteCanvas, 0, 0);
+
+    // FPS sample (rolling 500ms window).
+    frames++;
+    const eFps = now - lastFpsT;
+    if (eFps >= 500) {
+      fps = (frames * 1000) / eFps;
+      frames = 0;
+      lastFpsT = now;
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // QA / inspection hook (read-only).
+  window.__neonFluid = {
+    get fps()       { return fps; },
+    get particles() { return NUM_PARTICLES; },
+    get mouse()     { return mouse; },
+    get bounds()    { return { W: W, H: H }; }
+  };
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
