@@ -10,11 +10,11 @@
 
 ## 🎬 라이브 데모 (Live Demo)
 
-> **👉 [https://neon-fluid-one.vercel.app/](https://neon-fluid-one.vercel.app/)** — 브라우저에서 바로 실행 (60fps)
+> **👉 [https://sigco3111.github.io/neon-fluid/](https://sigco3111.github.io/neon-fluid/)** — 브라우저에서 바로 실행 (60fps)
 
 | | |
 |---|---|
-| ![Demo](https://img.shields.io/badge/Live-Demo-7C3AED?style=for-the-badge&logo=vercel&logoColor=white) | [![Repo](https://img.shields.io/badge/GitHub-sigco3111%2Fneon--fluid-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sigco3111/neon-fluid) |
+| ![Demo](https://img.shields.io/badge/Live-Demo-222222?style=for-the-badge&logo=githubpages&logoColor=white) | [![Repo](https://img.shields.io/badge/GitHub-sigco3111%2Fneon--fluid-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sigco3111/neon-fluid) |
 | ![Status](https://img.shields.io/badge/Status-Live-22C55E?style=flat-square) | ![Stack](https://img.shields.io/badge/Stack-Vanilla_JS-F7DF1E?style=flat-square&logo=javascript&logoColor=black) |
 | ![License](https://img.shields.io/badge/License-MIT-F1C40F?style=flat-square) | ![Deps](https://img.shields.io/badge/Dependencies-0-9CA3AF?style=flat-square) |
 
@@ -80,7 +80,7 @@ python3 -m http.server 8000
 # → http://localhost:8000
 ```
 
-### 방법 3: 라이브 데모 (Vercel)
+### 방법 3: 라이브 데모 (GitHub Pages)
 배포 후 URL이 발급되면 별도 설치 없이 바로 확인 가능합니다.
 
 ---
